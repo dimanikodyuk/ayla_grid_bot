@@ -42,7 +42,8 @@ canvas{display:block;width:100%;height:350px}#tvChart{width:100%;height:420px;po
 <details class="panel section"><summary style="cursor:pointer;font-weight:700">📨 Telegram · додатково</summary><div class="form" style="margin-top:15px"><label class="check"><input type="checkbox" id="tgEnabled"> Повідомлення</label><label class="check"><input type="checkbox" id="tgTrades"> Про угоди</label><label class="check"><input type="checkbox" id="tgDaily"> Щоденний звіт</label><label>Година за Києвом<input type="number" id="tgHour" min="0" max="23"></label></div><div class="controls"><button onclick="saveTelegram()">Зберегти</button><button onclick="action('telegram/test')">Тестове повідомлення</button><small id="tgHint">Токен і Chat ID — лише у .env</small></div></details>
 <p class="note">PAPER ONLY · Ключі Bybit із .env не використовуються для виставлення ордерів. Не відкривайте цей вебсервер у публічний інтернет.</p>
 </main><script>
-const $=id=>document.getElementById(id);let last=null,formInit=false,tgInit=false,candleData=null,tv=null,candleSeries=null,priceLines=[],tradeMarkers=[];
+const $=id=>document.getElementById(id);let last=null,formInit=false,tgInit=false,candleData=null,tv=null,candleSeries=null,volumeSeries=null,priceLines=[],tradeMarkers=[];
+let chartNet=null,currentInterval=null,ws=null,wsTimer=null,wsPing=null,wsRetry=0,wsLast=0;
 const fmt=(x,n=2)=>x==null||!Number.isFinite(Number(x))?'—':Number(x).toFixed(n);
 async function api(path,options={}){const r=await fetch('/api/'+path,{cache:'no-store',...options});let j=await r.json();if(!r.ok)throw Error(typeof j.detail==='string'?j.detail:JSON.stringify(j.detail||r.status));return j}
 async function post(path,body){return api(path,{method:'POST',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined})}
