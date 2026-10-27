@@ -417,11 +417,6 @@ def analytics():
             'pnl':equity-w['initial'],'max_drawdown_pct':max_dd,
             'note':'PnL включає відкриті позиції; завершені цикли окремо не розраховуються.'}
 
-if __name__ == '__main__':
-    import uvicorn
-    uvicorn.run(app,host='0.0.0.0',port=int(os.getenv('PORT','8090')),log_level='info')
-
-
 # API credentials are used ONLY to verify the key's permissions; NEVER to place orders.
 # Admin token protects credential management on the LAN. Do not expose port 8090 publicly.
 def require_admin(token: str | None):
@@ -445,7 +440,8 @@ class KeyInput(BaseModel):
 
 
 @app.get('/api/keys/status')
-def keys_status():
+def keys_status(x_ayla_admin_token: str | None = Header(default=None)):
+    require_admin(x_ayla_admin_token)
     keys=read_keys()
     return {'mainnet': bool(keys.get('mainnet',{}).get('api_key')),
             'testnet': bool(keys.get('testnet',{}).get('api_key')),
@@ -467,7 +463,7 @@ async def verify_key(network, key, secret):
     if payload.get('retCode')!=0:
         return {'valid':False,'network':network,'code':payload.get('retCode'),'message':payload.get('retMsg','Unknown Bybit error')}
     info=payload.get('result') or {}
-    return {'valid':True,'network':network,'read_only':bool(info.get('readOnly')),
+    return {'valid':True,'network':network,'read_only':str(info.get('readOnly')) == '1',
             'permissions':info.get('permissions',{}),
             'ip_restrictions':bool(info.get('ips')),
             'note':'Ключ дійсний. Жодних торгових запитів не виконано.'}
@@ -516,7 +512,16 @@ def delete_key(data:NetworkKeyInput,x_ayla_admin_token:str|None=Header(default=N
     require_admin(x_ayla_admin_token)
     if data.network not in BASE_URLS: raise HTTPException(422,'Невідома мережа')
     keys=read_keys(); keys.pop(data.network,None)
-    KEY_FILE.write_text(json.dumps(keys),encoding='utf-8'); KEY_FILE.chmod(0o600)
+    import tempfile
+    fd, temp = tempfile.mkstemp(prefix='.bybit_', dir=ROOT)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(keys, f)
+        os.replace(temp, KEY_FILE)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
     return {'ok':True}
 
 
@@ -537,3 +542,7 @@ async def candles(interval:str='15',limit:int=160):
         orders=[{'price':row['price'],'side':row['side']} for row in c.execute('SELECT side,price FROM orders WHERE status="OPEN"')]
         trades=[{'ts':row['ts'],'price':row['price'],'side':row['side']} for row in c.execute('SELECT ts,price,side FROM trades ORDER BY id DESC LIMIT 200')]
     return {'network':network,'symbol':SYMBOL,'interval':interval,'candles':bars,'orders':orders,'trades':trades,'mode':'PAPER'}
+
+if __name__ == '__main__':
+    import uvicorn
+    uvicorn.run(app,host='0.0.0.0',port=int(os.getenv('PORT','8090')),log_level='info')
