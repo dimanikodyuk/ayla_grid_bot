@@ -223,15 +223,15 @@ async def market_loop():
                 price = float(ticker['lastPrice'])
                 bid = float(ticker['bid1Price'])
                 ask = float(ticker['ask1Price'])
-                if min(price,bid,ask) <= 0 or bid > ask:
+                if min(price,bid,ask) <= 0 or bid > ask or (ask-bid)/price > 0.05:
                     raise ValueError('Некоректні ціни Bybit')
                 state.update(price=price,bid=bid,ask=ask,updated=now(),last_success=now(),error=None)
                 simulate(price,bid,ask)
             except Exception as exc:
                 state['error'] = f'{type(exc).__name__}: {exc}'
-                state['running'] = False
-                put_settings({'paper_running':'0'})
-                log.exception('Market data failure')
+                # Keep user intent on transient API failures; simulate() runs only on fresh valid quotes.
+                # No fills are replayed for missing ticks.
+                log.warning('Market data unavailable (will retry): %s', exc)
             await asyncio.sleep(5)
 
 @asynccontextmanager
@@ -252,7 +252,7 @@ async def lifespan(app):
         try: await notifier
         except asyncio.CancelledError: pass
 
-app = FastAPI(title='Ayla Grid Bot', version='0.7.0', lifespan=lifespan)
+app = FastAPI(title='Ayla Grid Bot', version='0.8.0', lifespan=lifespan)
 
 @app.get('/')
 def home():
@@ -272,7 +272,7 @@ def status():
         totals = c.execute('SELECT COUNT(*) AS n, COALESCE(SUM(fee),0) AS fees FROM trades').fetchone()
     equity = w['usdt'] + w['sol'] * state['bid'] if state['bid'] else None
     quote_age=(datetime.now(timezone.utc)-datetime.fromisoformat(state['updated'])).total_seconds() if state['updated'] else None
-    return {'quote_age_seconds':round(quote_age,1) if quote_age is not None else None,'mode':'PAPER','network':setting('network'),'symbol':SYMBOL,'api_key_configured':bool(os.getenv('BYBIT_API_KEY') and os.getenv('BYBIT_API_SECRET')),**state,'usdt':w['usdt'],'sol':w['sol'],
+    return {'quote_age_seconds':round(quote_age,1) if quote_age is not None else None,'mode':'PAPER','network':setting('network'),'symbol':SYMBOL,**state,'usdt':w['usdt'],'sol':w['sol'],
             'initial':w['initial'],'equity':equity,'pnl':equity-w['initial'] if equity is not None else None,
             'drawdown_pct':max(0,(1-equity/w['peak'])*100) if equity is not None and w['peak'] else None,
             'center':center['center'] if center else None,'orders':orders,'trades':trades,'prices':prices,
@@ -428,23 +428,46 @@ def analytics():
             'note':'PnL включає відкриті позиції; завершені цикли окремо не розраховуються.'}
 
 
+
+@app.get('/api/markets')
+async def markets():
+    """Public ticker comparison; never changes the trading environment."""
+    async def get_one(client, network):
+        try:
+            r=await client.get(BASE_URLS[network]+'/v5/market/tickers',params={'category':'spot','symbol':SYMBOL})
+            r.raise_for_status()
+            payload=r.json()
+            if payload.get('retCode') != 0: raise ValueError(payload.get('retMsg','Bybit error'))
+            t=payload['result']['list'][0]
+            return {'network':network,'price':float(t['lastPrice']),
+                    'change_24h_pct':round(float(t.get('price24hPcnt') or 0)*100,3),
+                    'volume_24h':float(t.get('volume24h') or 0), 'updated':now()}
+        except Exception as exc:
+            return {'network':network,'error':f'{type(exc).__name__}: {exc}'}
+    async with httpx.AsyncClient(timeout=10) as client:
+        result=await asyncio.gather(get_one(client,'mainnet'),get_one(client,'testnet'))
+    return {'trading_network':setting('network'),'markets':result,'mode':'PAPER'}
+
 @app.get('/api/candles')
-async def candles(interval:str='15',limit:int=500):
+async def candles(interval:str='15',limit:int=500,network:str|None=None):
     if interval not in ('1','5','15','30','60','240','D'): raise HTTPException(422,'Невірний інтервал')
     if not 20<=limit<=1000: raise HTTPException(422,'limit 20..1000')
-    network=setting('network','mainnet')
+    network=network or setting('network','mainnet')
+    if network not in BASE_URLS: raise HTTPException(422,'network: mainnet або testnet')
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r=await client.get(BASE_URLS[network]+'/v5/market/kline',params={'category':'spot','symbol':SYMBOL,'interval':interval,'limit':limit})
             r.raise_for_status(); payload=r.json()
     except (httpx.HTTPError,ValueError) as e: raise HTTPException(502,str(e))
     if payload.get('retCode')!=0: raise HTTPException(502,payload.get('retMsg','Bybit error'))
-    bars=[{'time':int(x[0])//1000,'open':float(x[1]),'high':float(x[2]),'low':float(x[3]),'close':float(x[4])} for x in payload.get('result',{}).get('list',[])]
+    bars=[{'time':int(x[0])//1000,'open':float(x[1]),'high':float(x[2]),'low':float(x[3]),'close':float(x[4]),'volume':float(x[5])} for x in payload.get('result',{}).get('list',[])]
     bars.sort(key=lambda x:x['time'])
     with connection() as c:
         orders=[{'price':row['price'],'side':row['side']} for row in c.execute('SELECT side,price FROM orders WHERE status="OPEN"')]
         trades=[{'ts':row['ts'],'price':row['price'],'side':row['side']} for row in c.execute('SELECT ts,price,side FROM trades ORDER BY id DESC LIMIT 200')]
-    return {'network':network,'symbol':SYMBOL,'interval':interval,'candles':bars,'orders':orders,'trades':trades,'mode':'PAPER'}
+    if network != setting('network'):
+        orders=[]; trades=[]  # Never overlay orders from another market on comparison chart
+    return {'network':network,'trading_network':setting('network'),'symbol':SYMBOL,'interval':interval,'candles':bars,'orders':orders,'trades':trades,'mode':'PAPER'}
 
 
 if __name__ == '__main__':
