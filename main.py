@@ -1,5 +1,9 @@
 import asyncio
 import json
+import hmac
+import hashlib
+import time
+import secrets
 import logging
 import os
 import sqlite3
@@ -9,7 +13,7 @@ from statistics import mean
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse
 
 ROOT = Path(__file__).resolve().parent
@@ -18,7 +22,8 @@ for line in (ROOT / '.env').read_text(encoding='utf-8').splitlines() if (ROOT / 
     if '=' in line and not line.lstrip().startswith('#'):
         key,value=line.split('=',1)
         os.environ.setdefault(key.strip(),value.strip().strip('\"').strip("'"))
-DB = ROOT / 'ayla_v04.db'
+DB = ROOT / 'ayla_v04.db'  # Preserve existing paper database during upgrade
+KEY_FILE = ROOT / '.bybit_credentials.json'
 BASE_URLS = {'mainnet':'https://api.bybit.com','testnet':'https://api-testnet.bybit.com'}
 
 SYMBOL = 'SOLUSDT'
@@ -227,7 +232,7 @@ async def lifespan(app):
         try: await notifier
         except asyncio.CancelledError: pass
 
-app = FastAPI(title='Ayla Grid Bot', version='0.4.0', lifespan=lifespan)
+app = FastAPI(title='Ayla Grid Bot', version='0.5.0', lifespan=lifespan)
 
 @app.get('/')
 def home():
@@ -415,3 +420,120 @@ def analytics():
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run(app,host='0.0.0.0',port=int(os.getenv('PORT','8090')),log_level='info')
+
+
+# API credentials are used ONLY to verify the key's permissions; NEVER to place orders.
+# Admin token protects credential management on the LAN. Do not expose port 8090 publicly.
+def require_admin(token: str | None):
+    expected = os.getenv('AYLA_ADMIN_TOKEN', '').strip()
+    if not expected:
+        raise HTTPException(503, 'Set AYLA_ADMIN_TOKEN in .env and restart the service')
+    if not token or not secrets.compare_digest(token, expected):
+        raise HTTPException(403, 'Невірний адміністративний токен')
+
+
+def read_keys():
+    if not KEY_FILE.exists(): return {}
+    try: return json.loads(KEY_FILE.read_text(encoding='utf-8'))
+    except (ValueError, OSError): return {}
+
+
+class KeyInput(BaseModel):
+    network: str
+    api_key: str
+    api_secret: str
+
+
+@app.get('/api/keys/status')
+def keys_status():
+    keys=read_keys()
+    return {'mainnet': bool(keys.get('mainnet',{}).get('api_key')),
+            'testnet': bool(keys.get('testnet',{}).get('api_key')),
+            'note': 'Тільки перевірка ключів. Реальні ордери заборонені.'}
+
+
+async def verify_key(network, key, secret):
+    if network not in BASE_URLS: raise HTTPException(422,'Невідома мережа')
+    ts=str(int(time.time()*1000)); recv='5000'
+    signature=hmac.new(secret.encode(), (ts+key+recv).encode(), hashlib.sha256).hexdigest()
+    headers={'X-BAPI-API-KEY':key,'X-BAPI-TIMESTAMP':ts,'X-BAPI-RECV-WINDOW':recv,'X-BAPI-SIGN':signature,'X-BAPI-SIGN-TYPE':'2'}
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            response=await client.get(BASE_URLS[network]+'/v5/user/query-api',headers=headers)
+            response.raise_for_status()
+            payload=response.json()
+    except (httpx.HTTPError,ValueError) as e:
+        raise HTTPException(502,'Помилка зв’язку з Bybit: '+str(e))
+    if payload.get('retCode')!=0:
+        return {'valid':False,'network':network,'code':payload.get('retCode'),'message':payload.get('retMsg','Unknown Bybit error')}
+    info=payload.get('result') or {}
+    return {'valid':True,'network':network,'read_only':bool(info.get('readOnly')),
+            'permissions':info.get('permissions',{}),
+            'ip_restrictions':bool(info.get('ips')),
+            'note':'Ключ дійсний. Жодних торгових запитів не виконано.'}
+
+
+@app.post('/api/keys/check')
+async def check_keys(data:KeyInput,x_ayla_admin_token:str|None=Header(default=None)):
+    require_admin(x_ayla_admin_token)
+    if not data.api_key.strip() or not data.api_secret.strip(): raise HTTPException(422,'Введи обидва значення')
+    return await verify_key(data.network,data.api_key.strip(),data.api_secret.strip())
+
+
+@app.post('/api/keys/save')
+async def save_keys(data:KeyInput,x_ayla_admin_token:str|None=Header(default=None)):
+    require_admin(x_ayla_admin_token)
+    key=data.api_key.strip(); secret=data.api_secret.strip()
+    result=await verify_key(data.network,key,secret)
+    if not result['valid']: return result
+    existing=read_keys(); existing[data.network]={'api_key':key,'api_secret':secret}
+    import tempfile
+    fd,temp=tempfile.mkstemp(prefix='.bybit_',dir=ROOT)
+    try:
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd,'w',encoding='utf-8') as f: json.dump(existing,f)
+        os.replace(temp,KEY_FILE)
+    finally:
+        if os.path.exists(temp): os.unlink(temp)
+    result['saved']=True
+    return result
+
+
+class NetworkKeyInput(BaseModel):
+    network: str
+
+
+@app.post('/api/keys/check-saved')
+async def check_saved_key(data:NetworkKeyInput,x_ayla_admin_token:str|None=Header(default=None)):
+    require_admin(x_ayla_admin_token)
+    keys=read_keys().get(data.network) or {}
+    if not keys: raise HTTPException(404,'Ключ для цієї мережі не збережено')
+    return await verify_key(data.network,keys['api_key'],keys['api_secret'])
+
+
+@app.post('/api/keys/delete')
+def delete_key(data:NetworkKeyInput,x_ayla_admin_token:str|None=Header(default=None)):
+    require_admin(x_ayla_admin_token)
+    if data.network not in BASE_URLS: raise HTTPException(422,'Невідома мережа')
+    keys=read_keys(); keys.pop(data.network,None)
+    KEY_FILE.write_text(json.dumps(keys),encoding='utf-8'); KEY_FILE.chmod(0o600)
+    return {'ok':True}
+
+
+@app.get('/api/candles')
+async def candles(interval:str='15',limit:int=160):
+    if interval not in ('1','5','15','30','60','240','D'): raise HTTPException(422,'Невірний інтервал')
+    if not 20<=limit<=500: raise HTTPException(422,'limit 20..500')
+    network=setting('network','mainnet')
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r=await client.get(BASE_URLS[network]+'/v5/market/kline',params={'category':'spot','symbol':SYMBOL,'interval':interval,'limit':limit})
+            r.raise_for_status(); payload=r.json()
+    except (httpx.HTTPError,ValueError) as e: raise HTTPException(502,str(e))
+    if payload.get('retCode')!=0: raise HTTPException(502,payload.get('retMsg','Bybit error'))
+    bars=[{'time':int(x[0])//1000,'open':float(x[1]),'high':float(x[2]),'low':float(x[3]),'close':float(x[4])} for x in payload.get('result',{}).get('list',[])]
+    bars.sort(key=lambda x:x['time'])
+    with connection() as c:
+        orders=[{'price':row['price'],'side':row['side']} for row in c.execute('SELECT side,price FROM orders WHERE status="OPEN"')]
+        trades=[{'ts':row['ts'],'price':row['price'],'side':row['side']} for row in c.execute('SELECT ts,price,side FROM trades ORDER BY id DESC LIMIT 200')]
+    return {'network':network,'symbol':SYMBOL,'interval':interval,'candles':bars,'orders':orders,'trades':trades,'mode':'PAPER'}

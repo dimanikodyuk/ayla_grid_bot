@@ -3,3 +3,5 @@
 *.db
 __pycache__/
 .pytest_cache/
+
+.bybit_credentials.json
