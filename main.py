@@ -13,11 +13,29 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse
 
 ROOT = Path(__file__).resolve().parent
-# Local secrets only; never commit .env. Existing environment variables take precedence.
-for line in (ROOT / '.env').read_text(encoding='utf-8').splitlines() if (ROOT / '.env').exists() else []:
-    if '=' in line and not line.lstrip().startswith('#'):
+# Parse .env safely: inline comments are allowed, real process environment takes priority.
+# Never log secrets.
+def load_env(path):
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding='utf-8-sig').splitlines():
+        line=raw.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
         key,value=line.split('=',1)
-        os.environ.setdefault(key.strip(),value.strip().strip('\"').strip("'"))
+        key=key.strip()
+        if not key.isidentifier():
+            continue
+        value=value.strip()
+        if value.startswith(('"', "'")):
+            quote=value[0]
+            end=value.find(quote,1)
+            if end!=-1:
+                value=value[1:end]
+        else:
+            value=value.split(' #',1)[0].strip()
+        os.environ.setdefault(key,value)
+load_env(ROOT / '.env')
 DB = ROOT / 'ayla_v04.db'  # Preserve existing paper database during upgrade
 BASE_URLS = {'mainnet':'https://api.bybit.com','testnet':'https://api-testnet.bybit.com'}
 
@@ -50,6 +68,7 @@ def init_db():
         c.execute('INSERT OR IGNORE INTO config VALUES (1,0.012,6,10,20,0)')
         c.execute('CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
         c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)',('network',os.getenv('BYBIT_ENV','mainnet').lower() if os.getenv('BYBIT_ENV','mainnet').lower() in BASE_URLS else 'mainnet'))
+        c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)',('paper_running','0'))
         c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)',('tg_enabled','0'))
         c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)',('tg_daily','1'))
         c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)',('tg_trades','1'))
@@ -157,6 +176,7 @@ def simulate(price, bid, ask):
         peak = max(peak, equity)
         if equity <= peak * (1 - MAX_DRAWDOWN):
             state['running'] = False
+            put_settings({'paper_running':'0'})
             state['error'] = 'Захист: просадка портфеля досягла 8%. Торгівлю зупинено.'
             c.execute('UPDATE wallet SET peak=? WHERE id=1', (peak,))
             return
@@ -210,12 +230,14 @@ async def market_loop():
             except Exception as exc:
                 state['error'] = f'{type(exc).__name__}: {exc}'
                 state['running'] = False
+                put_settings({'paper_running':'0'})
                 log.exception('Market data failure')
             await asyncio.sleep(5)
 
 @asynccontextmanager
 async def lifespan(app):
     init_db()
+    state['running'] = setting('paper_running','0') == '1'
     task = asyncio.create_task(market_loop())
     notifier = asyncio.create_task(notification_loop())
     try:
@@ -230,7 +252,7 @@ async def lifespan(app):
         try: await notifier
         except asyncio.CancelledError: pass
 
-app = FastAPI(title='Ayla Grid Bot', version='0.6.0', lifespan=lifespan)
+app = FastAPI(title='Ayla Grid Bot', version='0.7.0', lifespan=lifespan)
 
 @app.get('/')
 def home():
@@ -249,7 +271,8 @@ def status():
     with connection() as c:
         totals = c.execute('SELECT COUNT(*) AS n, COALESCE(SUM(fee),0) AS fees FROM trades').fetchone()
     equity = w['usdt'] + w['sol'] * state['bid'] if state['bid'] else None
-    return {'mode':'PAPER','network':setting('network'),'symbol':SYMBOL,'api_key_configured':bool(os.getenv('BYBIT_API_KEY') and os.getenv('BYBIT_API_SECRET')),**state,'usdt':w['usdt'],'sol':w['sol'],
+    quote_age=(datetime.now(timezone.utc)-datetime.fromisoformat(state['updated'])).total_seconds() if state['updated'] else None
+    return {'quote_age_seconds':round(quote_age,1) if quote_age is not None else None,'mode':'PAPER','network':setting('network'),'symbol':SYMBOL,'api_key_configured':bool(os.getenv('BYBIT_API_KEY') and os.getenv('BYBIT_API_SECRET')),**state,'usdt':w['usdt'],'sol':w['sol'],
             'initial':w['initial'],'equity':equity,'pnl':equity-w['initial'] if equity is not None else None,
             'drawdown_pct':max(0,(1-equity/w['peak'])*100) if equity is not None and w['peak'] else None,
             'center':center['center'] if center else None,'orders':orders,'trades':trades,'prices':prices,
@@ -259,14 +282,16 @@ def status():
 
 @app.post('/api/start')
 def start():
-    if not state['price'] or state['error']:
+    if not state['price'] or state['error'] or not state['updated'] or (datetime.now(timezone.utc)-datetime.fromisoformat(state['updated'])).total_seconds()>20:
         raise HTTPException(503,'Немає актуальних котирувань Bybit')
     state['running'] = True
+    put_settings({'paper_running':'1'})
     return {'ok':True,'running':True}
 
 @app.post('/api/pause')
 def pause():
     state['running'] = False
+    put_settings({'paper_running':'0'})
     return {'ok':True,'running':False}
 
 @app.post('/api/reset')
@@ -278,11 +303,13 @@ def reset():
             c.execute(f'DELETE FROM {table}')
         c.execute('INSERT INTO wallet VALUES (1,100,0,100,100)')
     state['error'] = None
+    put_settings({'paper_running':'0'})
     return {'ok':True}
 
 @app.get('/api/health')
 def health():
-    return {'ok':True,'market_connected':state['price'] is not None and state['error'] is None,'error':state['error'],'updated':state['updated']}
+    age=(datetime.now(timezone.utc)-datetime.fromisoformat(state['updated'])).total_seconds() if state['updated'] else None
+    return {'ok':True,'market_connected':age is not None and age<20 and state['error'] is None,'quote_age_seconds':round(age,1) if age is not None else None,'error':state['error'],'updated':state['updated']}
 
 
 from pydantic import BaseModel, Field
@@ -379,7 +406,7 @@ def telegram_settings(data: TelegramInput):
 
 @app.post('/api/telegram/test')
 async def telegram_test():
-    try: await telegram_send('🐶 Ayla Grid Bot v0.4 · тестове повідомлення · PAPER')
+    try: await telegram_send('🐶 Ayla Grid Bot v0.7 · тестове повідомлення · PAPER')
     except Exception as exc: raise HTTPException(503,str(exc))
     return {'ok':True}
 
@@ -402,9 +429,9 @@ def analytics():
 
 
 @app.get('/api/candles')
-async def candles(interval:str='15',limit:int=160):
+async def candles(interval:str='15',limit:int=500):
     if interval not in ('1','5','15','30','60','240','D'): raise HTTPException(422,'Невірний інтервал')
-    if not 20<=limit<=500: raise HTTPException(422,'limit 20..500')
+    if not 20<=limit<=1000: raise HTTPException(422,'limit 20..1000')
     network=setting('network','mainnet')
     try:
         async with httpx.AsyncClient(timeout=15) as client:
