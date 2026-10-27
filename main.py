@@ -1,9 +1,5 @@
 import asyncio
 import json
-import hmac
-import hashlib
-import time
-import secrets
 import logging
 import os
 import sqlite3
@@ -23,7 +19,6 @@ for line in (ROOT / '.env').read_text(encoding='utf-8').splitlines() if (ROOT / 
         key,value=line.split('=',1)
         os.environ.setdefault(key.strip(),value.strip().strip('\"').strip("'"))
 DB = ROOT / 'ayla_v04.db'  # Preserve existing paper database during upgrade
-KEY_FILE = ROOT / '.bybit_credentials.json'
 BASE_URLS = {'mainnet':'https://api.bybit.com','testnet':'https://api-testnet.bybit.com'}
 
 SYMBOL = 'SOLUSDT'
@@ -54,7 +49,7 @@ def init_db():
         c.execute('CREATE TABLE IF NOT EXISTS config (id INTEGER PRIMARY KEY CHECK(id=1), gap REAL NOT NULL, steps INTEGER NOT NULL, order_usdt REAL NOT NULL, reserve REAL NOT NULL, adaptive INTEGER NOT NULL)')
         c.execute('INSERT OR IGNORE INTO config VALUES (1,0.012,6,10,20,0)')
         c.execute('CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
-        c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)',('network','mainnet'))
+        c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)',('network',os.getenv('BYBIT_ENV','mainnet').lower() if os.getenv('BYBIT_ENV','mainnet').lower() in BASE_URLS else 'mainnet'))
         c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)',('tg_enabled','0'))
         c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)',('tg_daily','1'))
         c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)',('tg_trades','1'))
@@ -62,6 +57,9 @@ def init_db():
         c.execute('CREATE TABLE IF NOT EXISTS notifications (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
 
 def setting(key, default=''):
+    if key == 'network':
+        value = os.getenv('BYBIT_ENV','mainnet').strip().lower()
+        return value if value in BASE_URLS else 'mainnet'
     with connection() as c:
         row=c.execute('SELECT value FROM app_settings WHERE key=?',(key,)).fetchone()
         return row['value'] if row else default
@@ -232,11 +230,11 @@ async def lifespan(app):
         try: await notifier
         except asyncio.CancelledError: pass
 
-app = FastAPI(title='Ayla Grid Bot', version='0.5.0', lifespan=lifespan)
+app = FastAPI(title='Ayla Grid Bot', version='0.6.0', lifespan=lifespan)
 
 @app.get('/')
 def home():
-    return FileResponse(ROOT / 'index.html')
+    return FileResponse(ROOT / 'index.html', headers={'Cache-Control':'no-store'})
 
 @app.get('/api/status')
 def status():
@@ -248,13 +246,15 @@ def status():
         prices = [dict(r) for r in c.execute('SELECT * FROM (SELECT rowid,ts,price FROM prices ORDER BY rowid DESC LIMIT 300) ORDER BY rowid')]
         cfg = dict(c.execute('SELECT * FROM config WHERE id=1').fetchone())
         equity_history = [dict(r) for r in c.execute('SELECT * FROM (SELECT rowid,ts,equity FROM equity_history ORDER BY rowid DESC LIMIT 500) ORDER BY rowid')]
+    with connection() as c:
+        totals = c.execute('SELECT COUNT(*) AS n, COALESCE(SUM(fee),0) AS fees FROM trades').fetchone()
     equity = w['usdt'] + w['sol'] * state['bid'] if state['bid'] else None
-    return {'mode':'PAPER','network':setting('network'),'symbol':SYMBOL,**state,'usdt':w['usdt'],'sol':w['sol'],
+    return {'mode':'PAPER','network':setting('network'),'symbol':SYMBOL,'api_key_configured':bool(os.getenv('BYBIT_API_KEY') and os.getenv('BYBIT_API_SECRET')),**state,'usdt':w['usdt'],'sol':w['sol'],
             'initial':w['initial'],'equity':equity,'pnl':equity-w['initial'] if equity is not None else None,
-            'drawdown_pct':(1-equity/w['peak'])*100 if equity is not None and w['peak'] else None,
+            'drawdown_pct':max(0,(1-equity/w['peak'])*100) if equity is not None and w['peak'] else None,
             'center':center['center'] if center else None,'orders':orders,'trades':trades,'prices':prices,
             'fee_rate':FEE,'grid_gap_pct':cfg['gap']*100,'reserve_usdt':cfg['reserve'],
-            'config':cfg,'equity_history':equity_history,'fees_total':sum(t['fee'] for t in trades),'fills_count':len(trades),
+            'config':cfg,'equity_history':equity_history,'fees_total':totals['fees'],'fills_count':totals['n'],
             'telegram':{'enabled':setting('tg_enabled')=='1','daily':setting('tg_daily')=='1','trades':setting('tg_trades')=='1','hour':int(setting('tg_hour','21')),'configured':bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID'))}}
 
 @app.post('/api/start')
@@ -364,23 +364,6 @@ async def backtest(days: int = 7, interval: str = '60'):
             'curve':curve,
             'limitations':'OHLC: один fill на свічку, без спреду, прослизання та часткових виконань. Результат не є прогнозом.'}
 
-class ExchangeInput(BaseModel):
-    network: str
-
-@app.post('/api/exchange')
-def exchange_config(data: ExchangeInput):
-    if data.network not in BASE_URLS: raise HTTPException(422,'mainnet або testnet')
-    if state['running']: raise HTTPException(409,'Спочатку Pause')
-    with connection() as c:
-        if c.execute('SELECT COUNT(*) FROM trades').fetchone()[0]:
-            raise HTTPException(409,'Для зміни мережі після угод потрібен Reset Paper')
-        c.execute('DELETE FROM orders')
-        c.execute('DELETE FROM settings')
-        c.execute('DELETE FROM prices')
-    put_settings({'network':data.network})
-    state.update(price=None,bid=None,ask=None,error=None,updated=None)
-    return {'ok':True,'network':data.network,'mode':'PAPER'}
-
 class TelegramInput(BaseModel):
     enabled: bool
     trades: bool = True
@@ -417,113 +400,6 @@ def analytics():
             'pnl':equity-w['initial'],'max_drawdown_pct':max_dd,
             'note':'PnL включає відкриті позиції; завершені цикли окремо не розраховуються.'}
 
-# API credentials are used ONLY to verify the key's permissions; NEVER to place orders.
-# Admin token protects credential management on the LAN. Do not expose port 8090 publicly.
-def require_admin(token: str | None):
-    expected = os.getenv('AYLA_ADMIN_TOKEN', '').strip()
-    if not expected:
-        raise HTTPException(503, 'Set AYLA_ADMIN_TOKEN in .env and restart the service')
-    if not token or not secrets.compare_digest(token, expected):
-        raise HTTPException(403, 'Невірний адміністративний токен')
-
-
-def read_keys():
-    if not KEY_FILE.exists(): return {}
-    try: return json.loads(KEY_FILE.read_text(encoding='utf-8'))
-    except (ValueError, OSError): return {}
-
-
-class KeyInput(BaseModel):
-    network: str
-    api_key: str
-    api_secret: str
-
-
-@app.get('/api/keys/status')
-def keys_status(x_ayla_admin_token: str | None = Header(default=None)):
-    require_admin(x_ayla_admin_token)
-    keys=read_keys()
-    return {'mainnet': bool(keys.get('mainnet',{}).get('api_key')),
-            'testnet': bool(keys.get('testnet',{}).get('api_key')),
-            'note': 'Тільки перевірка ключів. Реальні ордери заборонені.'}
-
-
-async def verify_key(network, key, secret):
-    if network not in BASE_URLS: raise HTTPException(422,'Невідома мережа')
-    ts=str(int(time.time()*1000)); recv='5000'
-    signature=hmac.new(secret.encode(), (ts+key+recv).encode(), hashlib.sha256).hexdigest()
-    headers={'X-BAPI-API-KEY':key,'X-BAPI-TIMESTAMP':ts,'X-BAPI-RECV-WINDOW':recv,'X-BAPI-SIGN':signature,'X-BAPI-SIGN-TYPE':'2'}
-    try:
-        async with httpx.AsyncClient(timeout=12) as client:
-            response=await client.get(BASE_URLS[network]+'/v5/user/query-api',headers=headers)
-            response.raise_for_status()
-            payload=response.json()
-    except (httpx.HTTPError,ValueError) as e:
-        raise HTTPException(502,'Помилка зв’язку з Bybit: '+str(e))
-    if payload.get('retCode')!=0:
-        return {'valid':False,'network':network,'code':payload.get('retCode'),'message':payload.get('retMsg','Unknown Bybit error')}
-    info=payload.get('result') or {}
-    return {'valid':True,'network':network,'read_only':str(info.get('readOnly')) == '1',
-            'permissions':info.get('permissions',{}),
-            'ip_restrictions':bool(info.get('ips')),
-            'note':'Ключ дійсний. Жодних торгових запитів не виконано.'}
-
-
-@app.post('/api/keys/check')
-async def check_keys(data:KeyInput,x_ayla_admin_token:str|None=Header(default=None)):
-    require_admin(x_ayla_admin_token)
-    if not data.api_key.strip() or not data.api_secret.strip(): raise HTTPException(422,'Введи обидва значення')
-    return await verify_key(data.network,data.api_key.strip(),data.api_secret.strip())
-
-
-@app.post('/api/keys/save')
-async def save_keys(data:KeyInput,x_ayla_admin_token:str|None=Header(default=None)):
-    require_admin(x_ayla_admin_token)
-    key=data.api_key.strip(); secret=data.api_secret.strip()
-    result=await verify_key(data.network,key,secret)
-    if not result['valid']: return result
-    existing=read_keys(); existing[data.network]={'api_key':key,'api_secret':secret}
-    import tempfile
-    fd,temp=tempfile.mkstemp(prefix='.bybit_',dir=ROOT)
-    try:
-        os.fchmod(fd,0o600)
-        with os.fdopen(fd,'w',encoding='utf-8') as f: json.dump(existing,f)
-        os.replace(temp,KEY_FILE)
-    finally:
-        if os.path.exists(temp): os.unlink(temp)
-    result['saved']=True
-    return result
-
-
-class NetworkKeyInput(BaseModel):
-    network: str
-
-
-@app.post('/api/keys/check-saved')
-async def check_saved_key(data:NetworkKeyInput,x_ayla_admin_token:str|None=Header(default=None)):
-    require_admin(x_ayla_admin_token)
-    keys=read_keys().get(data.network) or {}
-    if not keys: raise HTTPException(404,'Ключ для цієї мережі не збережено')
-    return await verify_key(data.network,keys['api_key'],keys['api_secret'])
-
-
-@app.post('/api/keys/delete')
-def delete_key(data:NetworkKeyInput,x_ayla_admin_token:str|None=Header(default=None)):
-    require_admin(x_ayla_admin_token)
-    if data.network not in BASE_URLS: raise HTTPException(422,'Невідома мережа')
-    keys=read_keys(); keys.pop(data.network,None)
-    import tempfile
-    fd, temp = tempfile.mkstemp(prefix='.bybit_', dir=ROOT)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(keys, f)
-        os.replace(temp, KEY_FILE)
-    finally:
-        if os.path.exists(temp):
-            os.unlink(temp)
-    return {'ok':True}
-
 
 @app.get('/api/candles')
 async def candles(interval:str='15',limit:int=160):
@@ -543,6 +419,7 @@ async def candles(interval:str='15',limit:int=160):
         trades=[{'ts':row['ts'],'price':row['price'],'side':row['side']} for row in c.execute('SELECT ts,price,side FROM trades ORDER BY id DESC LIMIT 200')]
     return {'network':network,'symbol':SYMBOL,'interval':interval,'candles':bars,'orders':orders,'trades':trades,'mode':'PAPER'}
 
+
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app,host='0.0.0.0',port=int(os.getenv('PORT','8090')),log_level='info')
+    uvicorn.run(app, host=os.getenv('HOST','0.0.0.0'), port=int(os.getenv('PORT','8090')), log_level='info')

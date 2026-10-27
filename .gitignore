@@ -1,7 +1,8 @@
-.venv/
 .env
 *.db
+*.db-*
+*.sqlite*
 __pycache__/
-.pytest_cache/
-
+*.pyc
 .bybit_credentials.json
+.venv/
