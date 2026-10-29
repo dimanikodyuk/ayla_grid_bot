@@ -181,7 +181,7 @@ def simulate(price, bid, ask):
             c.execute('UPDATE wallet SET peak=? WHERE id=1', (peak,))
             return
         # One execution per price update prevents unrealistic cascades on large price jumps.
-        rows = c.execute('SELECT * FROM orders WHERE status="OPEN" ORDER BY id').fetchall()
+        rows = c.execute('SELECT * FROM orders WHERE status=? ORDER BY id', ('OPEN',)).fetchall()
         for order in rows:
             side, limit_price, qty = order['side'], order['price'], order['qty']
             if side == 'BUY' and ask <= limit_price and usdt >= qty * ask * (1 + FEE) + cfg['reserve']:
@@ -201,7 +201,7 @@ def simulate(price, bid, ask):
             else:
                 continue
             ts = now()
-            c.execute('UPDATE orders SET status="FILLED",filled=? WHERE id=?', (ts,order['id']))
+            c.execute('UPDATE orders SET status=?,filled=? WHERE id=?', ('FILLED',ts,order['id']))
             c.execute('INSERT INTO trades(ts,side,price,qty,fee,order_id) VALUES (?,?,?,?,?,?)', (ts,side,fill,qty,fee,order['id']))
             c.execute('INSERT INTO orders(side,level,price,qty,status,created) VALUES (?,?,?,?,?,?)', (counterpart,order['level'],next_price,qty,'OPEN',ts))
             log.info('PAPER %s %.6f SOL at %.4f USDT',side,qty,fill)
@@ -231,7 +231,7 @@ async def market_loop():
                 state['error'] = f'{type(exc).__name__}: {exc}'
                 # Keep user intent on transient API failures; simulate() runs only on fresh valid quotes.
                 # No fills are replayed for missing ticks.
-                log.warning('Market data unavailable (will retry): %s', exc)
+                log.exception('Market tick / paper simulation failed (will retry): %s', exc)
             await asyncio.sleep(5)
 
 @asynccontextmanager
@@ -252,7 +252,7 @@ async def lifespan(app):
         try: await notifier
         except asyncio.CancelledError: pass
 
-app = FastAPI(title='Ayla Grid Bot', version='0.8.0', lifespan=lifespan)
+app = FastAPI(title='Ayla Grid Bot', version='0.8.2', lifespan=lifespan)
 
 @app.get('/')
 def home():
@@ -263,7 +263,7 @@ def status():
     with connection() as c:
         w = c.execute('SELECT * FROM wallet WHERE id=1').fetchone()
         center = c.execute('SELECT center FROM settings WHERE id=1').fetchone()
-        orders = [dict(r) for r in c.execute('SELECT * FROM orders WHERE status="OPEN" ORDER BY price')]
+        orders = [dict(r) for r in c.execute('SELECT * FROM orders WHERE status=? ORDER BY price', ('OPEN',))]
         trades = [dict(r) for r in c.execute('SELECT * FROM trades ORDER BY id DESC LIMIT 100')]
         prices = [dict(r) for r in c.execute('SELECT * FROM (SELECT rowid,ts,price FROM prices ORDER BY rowid DESC LIMIT 300) ORDER BY rowid')]
         cfg = dict(c.execute('SELECT * FROM config WHERE id=1').fetchone())
@@ -463,7 +463,7 @@ async def candles(interval:str='15',limit:int=500,network:str|None=None):
     bars=[{'time':int(x[0])//1000,'open':float(x[1]),'high':float(x[2]),'low':float(x[3]),'close':float(x[4]),'volume':float(x[5])} for x in payload.get('result',{}).get('list',[])]
     bars.sort(key=lambda x:x['time'])
     with connection() as c:
-        orders=[{'price':row['price'],'side':row['side']} for row in c.execute('SELECT side,price FROM orders WHERE status="OPEN"')]
+        orders=[{'price':row['price'],'side':row['side']} for row in c.execute('SELECT side,price FROM orders WHERE status=?', ('OPEN',))]
         trades=[{'ts':row['ts'],'price':row['price'],'side':row['side']} for row in c.execute('SELECT ts,price,side FROM trades ORDER BY id DESC LIMIT 200')]
     if network != setting('network'):
         orders=[]; trades=[]  # Never overlay orders from another market on comparison chart
