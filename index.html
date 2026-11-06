@@ -16,7 +16,7 @@ canvas{display:block;width:100%;height:350px}#tvChart{width:100%;height:420px;po
 @media(max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}.cols{grid-template-columns:1fr}}
 @media(max-width:500px){main{padding:12px}.grid{gap:8px}.card,.panel{padding:13px}.kpi{font-size:20px}.form{grid-template-columns:1fr}}
 </style></head><body><main>
-<header><div><h1>🐶 Ayla Grid <span class="muted">v0.8</span></h1><div class="muted">SOL/USDT · Spot · симуляція без реальних ордерів</div></div><div class="controls"><span id="net" class="badge">Bybit —</span><span id="state" class="badge">Завантаження…</span></div></header>
+<header><div><h1>🐶 Ayla Grid <span class="muted">v0.9</span></h1><div class="muted">SOL/USDT · Spot · симуляція без реальних ордерів</div></div><div class="controls"><span id="net" class="badge">Bybit —</span><span id="state" class="badge">Завантаження…</span></div></header>
 <div class="grid">
 <div class="card"><div class="muted">SOL / USDT</div><div class="kpi" id="price">—</div><small id="updated">Очікуємо дані</small></div>
 <div class="card"><div class="muted">Портфель</div><div class="kpi" id="equity">—</div><small id="wallet">—</small></div>
@@ -38,6 +38,23 @@ canvas{display:block;width:100%;height:350px}#tvChart{width:100%;height:420px;po
 <label class="check"><input id="adaptive" type="checkbox"> Адаптивний крок</label>
 </div><div class="controls"><button onclick="saveConfig()">Зберегти сітку</button><small>Потрібна пауза; після угод — Reset.</small></div></div>
 <div class="panel"><h2>📈 Результати та Backtest</h2><canvas class="smallcanvas" id="equityCanvas"></canvas><div class="controls"><select id="days"><option value="1">1 день</option><option value="3">3 дні</option><option value="7" selected>7 днів</option><option value="14">14 днів</option><option value="30">30 днів</option></select><button onclick="backtest()">Запустити Backtest</button></div><div class="note" id="bt">Тест приблизний: OHLC, без прослизання.</div></div>
+</div>
+<div class="cols section">
+<div class="panel"><h2>🧮 Аналітика Grid · v0.9</h2>
+<div class="grid" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+<div><small>Реалізований PnL (FIFO)</small><div class="kpi" id="realized">—</div></div>
+<div><small>Нереалізований PnL</small><div class="kpi" id="unrealized">—</div></div>
+<div><small>Середня собівартість SOL</small><div class="kpi" id="avgcost">—</div></div>
+<div><small>Частка SOL у портфелі</small><div class="kpi" id="solshare">—</div></div>
+</div><div class="note" id="positionNote">Завантаження аналітики…</div></div>
+<div class="panel"><h2>📐 Діапазон та адаптація</h2><div class="note" id="rangeStatus">Завантаження…</div>
+<div class="note" id="rangeAdvice">Безпечний автоперенос: лише коли SOL=0 та 6 годин поза сіткою; SELL і SOL не скидаються.</div>
+<div class="controls" style="margin-top:12px"><button onclick="loadStrategy()">Оновити аналітику</button></div>
+</div></div>
+<div class="panel section"><h2>⚖️ Порівняння стратегій · Static vs Adaptive</h2>
+<div class="controls"><select id="compareDays"><option value="1">1 день</option><option value="3">3 дні</option><option value="7" selected>7 днів</option><option value="14">14 днів</option><option value="30">30 днів</option></select>
+<button onclick="compareStrategies()">Порівняти на однакових свічках</button></div>
+<div id="strategyCompare" class="note">Адаптивний варіант переносить сітку лише коли SOL=0 і ціна нижче діапазону протягом 6 свічок. Реальні позиції не зачіпає.</div>
 </div>
 <details class="panel section"><summary style="cursor:pointer;font-weight:700">📨 Telegram · додатково</summary><div class="form" style="margin-top:15px"><label class="check"><input type="checkbox" id="tgEnabled"> Повідомлення</label><label class="check"><input type="checkbox" id="tgTrades"> Про угоди</label><label class="check"><input type="checkbox" id="tgDaily"> Щоденний звіт</label><label>Година за Києвом<input type="number" id="tgHour" min="0" max="23"></label></div><div class="controls"><button onclick="saveTelegram()">Зберегти</button><button onclick="action('telegram/test')">Тестове повідомлення</button><small id="tgHint">Токен і Chat ID — лише у .env</small></div></details>
 <p class="note">PAPER ONLY · Ключі Bybit із .env не використовуються для виставлення ордерів. Не відкривайте цей вебсервер у публічний інтернет.</p>
@@ -90,8 +107,19 @@ async function refresh(){try{const d=await api('status');const prevNetwork=last&
 $('message').textContent=d.error||'';$('orders').innerHTML=d.orders.map(o=>`<tr><td style="color:${o.side==='BUY'?'#4cdaa5':'#ff7188'}">${o.side}</td><td>${o.level}</td><td>${fmt(o.price,4)}</td><td>${fmt(o.qty,5)}</td></tr>`).join('')||'<tr><td colspan="4">Немає відкритих ордерів</td></tr>';$('trades').innerHTML=d.trades.slice(0,30).map(t=>`<tr><td>${new Date(t.ts).toLocaleString('uk-UA')}</td><td>${t.side}</td><td>${fmt(t.price,3)}</td><td>${fmt(t.fee,4)}</td></tr>`).join('')||'<tr><td colspan="4">Поки немає угод</td></tr>';lineChart('equityCanvas',(d.equity_history||[]).map(x=>x.equity));if(!formInit){$('gap').value=fmt(d.config.gap*100,2);$('steps').value=d.config.steps;$('order').value=d.config.order_usdt;$('reserve').value=d.config.reserve;$('adaptive').checked=!!d.config.adaptive;formInit=true}if(!tgInit){$('tgEnabled').checked=d.telegram.enabled;$('tgTrades').checked=d.telegram.trades;$('tgDaily').checked=d.telegram.daily;$('tgHour').value=d.telegram.hour;tgInit=true}$('tgHint').textContent=d.telegram.configured?'Telegram налаштований у .env':'Додай Telegram credentials у .env'}catch(e){$('state').textContent='🔴 OFFLINE';$('message').textContent=e.message}}
 async function saveConfig(){try{await post('config',{gap_pct:Number($('gap').value),steps:Number($('steps').value),order_usdt:Number($('order').value),reserve_usdt:Number($('reserve').value),adaptive:$('adaptive').checked});$('message').textContent='Налаштування збережено';await refresh()}catch(e){$('message').textContent=e.message}}
 async function backtest(){try{$('bt').textContent='Завантаження історії…';let d=await api('backtest?days='+$('days').value+'&interval=60');$('bt').textContent=`PnL: ${fmt(d.pnl,3)} USDT · Buy & Hold: ${fmt(d.buy_hold_pnl_pct,2)}% · Max DD: ${fmt(d.max_drawdown_pct,2)}% · угод: ${d.fills} · комісії: ${fmt(d.fees,3)} USDT. ${d.limitations}`}catch(e){$('bt').textContent='Помилка: '+e.message}}
+async function loadStrategy(){try{const d=await api('strategy');const p=d.position||{},r=d.range||{};
+$('realized').textContent=fmt(p.realized_pnl,4)+' USDT';$('unrealized').textContent=fmt(p.unrealized_pnl,4)+' USDT';
+$('avgcost').textContent=fmt(p.avg_open_cost,4)+' USDT';$('solshare').textContent=fmt(d.capital?.sol_pct,1)+'%';
+$('positionNote').textContent=`Відкрито ${fmt(p.open_sol_qty,6)} SOL · собівартість ${fmt(p.open_sol_cost,3)} USDT · завершені продажі ${fmt(p.matched_sell_sol,6)} SOL · зіставлення FIFO за рівнями.`;
+$('rangeStatus').textContent=`${r.state||'—'} · діапазон ${fmt(r.low,4)}–${fmt(r.high,4)} · BUY ${r.buy_count??'—'} / SELL ${r.sell_count??'—'} · до найближчого SELL ${fmt(r.distance_to_nearest_sell_pct,2)}%`;
+$('rangeAdvice').textContent=r.out_of_range?'⚠️ Ціна поза сіткою. Рекомендований центр для майбутньої сітки: '+fmt(r.suggested_center,4)+'. Автоперенос дозволений лише коли SOL=0 після 6 годин поза діапазоном; продаж SOL не виконується.':'Безпечний автоперенос лише коли SOL=0 після 6 годин поза діапазоном. Існуючі позиції збережені.';
+}catch(e){$('positionNote').textContent='Помилка: '+e.message}}
+async function compareStrategies(){try{$('strategyCompare').textContent='Обчислюємо…';const d=await api('strategy/compare?days='+$('compareDays').value+'&interval=60');
+$('strategyCompare').textContent=`Дані: ${d.coverage_days} днів / ${d.candles} свічок. STATIC: ${fmt(d.static.pnl_pct,3)}% · ${d.static.fills} угод · DD ${fmt(d.static.max_drawdown_pct,2)}%. ADAPTIVE: ${fmt(d.adaptive.pnl_pct,3)}% · ${d.adaptive.fills} угод · ${d.adaptive.rebases} переносів · DD ${fmt(d.adaptive.max_drawdown_pct,2)}%. Buy & Hold: ${fmt(d.buy_hold_pct,3)}%. ${d.limitations}`;
+}catch(e){$('strategyCompare').textContent='Помилка: '+e.message}}
 async function saveTelegram(){try{await post('telegram/settings',{enabled:$('tgEnabled').checked,trades:$('tgTrades').checked,daily:$('tgDaily').checked,hour:Number($('tgHour').value)});$('message').textContent='Telegram налаштовано'}catch(e){$('message').textContent=e.message}}
 
+setInterval(loadStrategy,30000);setTimeout(loadStrategy,1800);
 function getChartNetwork(){const selected=$('chartNetwork').value;return selected==='trade'?(last?.network||'mainnet'):selected}
 function switchChartNetwork(){chartNet=null;window.__chartFirstLoad=false;connectWS();loadCandles()}
 function switchInterval(){currentInterval=$('interval').value;window.__chartFirstLoad=false;connectWS();loadCandles()}

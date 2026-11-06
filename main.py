@@ -36,7 +36,11 @@ def load_env(path):
             value=value.split(' #',1)[0].strip()
         os.environ.setdefault(key,value)
 load_env(ROOT / '.env')
-DB = ROOT / 'ayla_v04.db'  # Preserve existing paper database during upgrade
+NETWORK = os.getenv('BYBIT_ENV','testnet').strip().lower()
+if NETWORK not in ('mainnet','testnet'):
+    raise RuntimeError('BYBIT_ENV must be mainnet or testnet')
+DB = ROOT / ('ayla_mainnet_paper.db' if NETWORK == 'mainnet' else 'ayla_v04.db')
+# PAPER ONLY: no authenticated Bybit order endpoints in this application
 BASE_URLS = {'mainnet':'https://api.bybit.com','testnet':'https://api-testnet.bybit.com'}
 
 SYMBOL = 'SOLUSDT'
@@ -74,11 +78,15 @@ def init_db():
         c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)',('tg_trades','1'))
         c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)',('tg_hour','21'))
         c.execute('CREATE TABLE IF NOT EXISTS notifications (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+        c.execute('CREATE TABLE IF NOT EXISTS market_samples (ts TEXT PRIMARY KEY, price REAL NOT NULL, bid REAL NOT NULL, ask REAL NOT NULL, equity REAL NOT NULL)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_trades_order_id ON trades(order_id)')
+        c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)', ('outside_since',''))
+        c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)', ('alert_outside_hours','6'))
+        c.execute('INSERT OR IGNORE INTO app_settings VALUES (?,?)', ('alert_no_trade_hours','24'))
 
 def setting(key, default=''):
     if key == 'network':
-        value = os.getenv('BYBIT_ENV','mainnet').strip().lower()
-        return value if value in BASE_URLS else 'mainnet'
+        return NETWORK
     with connection() as c:
         row=c.execute('SELECT value FROM app_settings WHERE key=?',(key,)).fetchone()
         return row['value'] if row else default
@@ -171,6 +179,27 @@ def simulate(price, bid, ask):
         make_grid(c, price)
         wallet = c.execute('SELECT * FROM wallet WHERE id=1').fetchone()
         usdt, sol, initial, peak = (wallet[k] for k in ('usdt','sol','initial','peak'))
+        # Safe auto-recenter: only when flat (no SOL), all orders BUY, and
+        # market has stayed outside the ladder for >=6 hours. Existing trades
+        # and balances are preserved; no forced sale or order cancellation with SOL.
+        if os.getenv('AYLA_AUTO_RECENTER','1') == '1':
+            open_orders=c.execute("SELECT side,price FROM orders WHERE status='OPEN'").fetchall()
+            outside=(bool(open_orders) and all(o['side']=='BUY' for o in open_orders)
+                     and (price<min(o['price'] for o in open_orders)
+                          or price>max(o['price'] for o in open_orders)))
+            old=c.execute("SELECT value FROM app_settings WHERE key='outside_since'").fetchone()
+            old_ts=old['value'] if old else ''
+            if outside and sol<1e-8:
+                if not old_ts:
+                    c.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES('outside_since',?)",(now(),))
+                elif (datetime.now(timezone.utc)-datetime.fromisoformat(old_ts)).total_seconds()>=6*3600:
+                    c.execute("DELETE FROM orders WHERE status='OPEN' AND side='BUY'")
+                    c.execute('DELETE FROM settings')
+                    make_grid(c,price)
+                    c.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES('outside_since','')")
+                    log.warning('PAPER safe auto-recenter at %.4f (flat portfolio, 6h outside)',price)
+            elif old_ts:
+                c.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES('outside_since','')")
         cfg = c.execute('SELECT * FROM config WHERE id=1').fetchone()
         equity = usdt + sol * bid
         peak = max(peak, equity)
@@ -209,6 +238,10 @@ def simulate(price, bid, ask):
         c.execute('UPDATE wallet SET usdt=?,sol=?,peak=? WHERE id=1',(usdt,max(0,sol),peak))
         c.execute('INSERT INTO equity_history VALUES (?,?)',(now(),usdt+max(0,sol)*bid))
         c.execute('DELETE FROM equity_history WHERE rowid NOT IN (SELECT rowid FROM equity_history ORDER BY rowid DESC LIMIT 10000)')
+        # Durable 15-minute snapshots for future analytics (no 1500-tick cap).
+        bucket = datetime.now(timezone.utc).replace(minute=(datetime.now(timezone.utc).minute//15)*15,second=0,microsecond=0).isoformat()
+        c.execute('INSERT OR REPLACE INTO market_samples(ts,price,bid,ask,equity) VALUES (?,?,?,?,?)',
+                  (bucket,price,bid,ask,usdt+max(0,sol)*bid))
 
 async def market_loop():
     async with httpx.AsyncClient(timeout=12, trust_env=True) as client:
@@ -240,19 +273,23 @@ async def lifespan(app):
     state['running'] = setting('paper_running','0') == '1'
     task = asyncio.create_task(market_loop())
     notifier = asyncio.create_task(notification_loop())
+    alert_task = asyncio.create_task(strategy_alerts())
     try:
         yield
     finally:
         task.cancel()
         notifier.cancel()
+        alert_task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
         try: await notifier
         except asyncio.CancelledError: pass
+        try: await alert_task
+        except asyncio.CancelledError: pass
 
-app = FastAPI(title='Ayla Grid Bot', version='0.8.2', lifespan=lifespan)
+app = FastAPI(title='Ayla Grid Bot', version='0.9.0', lifespan=lifespan)
 
 @app.get('/')
 def home():
@@ -272,7 +309,7 @@ def status():
         totals = c.execute('SELECT COUNT(*) AS n, COALESCE(SUM(fee),0) AS fees FROM trades').fetchone()
     equity = w['usdt'] + w['sol'] * state['bid'] if state['bid'] else None
     quote_age=(datetime.now(timezone.utc)-datetime.fromisoformat(state['updated'])).total_seconds() if state['updated'] else None
-    return {'quote_age_seconds':round(quote_age,1) if quote_age is not None else None,'mode':'PAPER','network':setting('network'),'symbol':SYMBOL,**state,'usdt':w['usdt'],'sol':w['sol'],
+    return {'quote_age_seconds':round(quote_age,1) if quote_age is not None else None,'mode':'PAPER','paper_only':True,'network':setting('network'),'symbol':SYMBOL,**state,'usdt':w['usdt'],'sol':w['sol'],
             'initial':w['initial'],'equity':equity,'pnl':equity-w['initial'] if equity is not None else None,
             'drawdown_pct':max(0,(1-equity/w['peak'])*100) if equity is not None and w['peak'] else None,
             'center':center['center'] if center else None,'orders':orders,'trades':trades,'prices':prices,
@@ -299,7 +336,7 @@ def reset():
     if state['running']:
         raise HTTPException(409,'Спочатку натисніть Pause')
     with connection() as c:
-        for table in ('wallet','settings','orders','trades','prices','equity_history'):
+        for table in ('wallet','settings','orders','trades','prices','equity_history','market_samples'):
             c.execute(f'DELETE FROM {table}')
         c.execute('INSERT INTO wallet VALUES (1,100,0,100,100)')
     state['error'] = None
@@ -428,6 +465,155 @@ def analytics():
             'note':'PnL включає відкриті позиції; завершені цикли окремо не розраховуються.'}
 
 
+
+
+# --- v0.9 analytics, range advisory and alerts ---
+from collections import deque
+
+def position_analysis(c, bid):
+    """Match fills FIFO by grid level. Realized PnL includes both fees.
+    Existing trades contain level via their filled order, but not direct parent IDs.
+    FIFO per level is exact for the one-open-order-per-level grid model.
+    """
+    rows=c.execute("SELECT t.id,t.ts,t.side,t.price,t.qty,t.fee,o.level FROM trades t LEFT JOIN orders o ON o.id=t.order_id ORDER BY t.id").fetchall()
+    queues={}; realized=0.; matched=0; unmatched_sells=0
+    for t in rows:
+        level=t['level']
+        if level is None: continue
+        q=queues.setdefault(level,deque())
+        if t['side']=='BUY':
+            q.append([t['qty'],t['price'],t['fee']/t['qty'] if t['qty'] else 0])
+        elif t['side']=='SELL':
+            remaining=t['qty']
+            while remaining>1e-10 and q:
+                lot=q[0]; take=min(remaining,lot[0]);
+                realized+=take*(t['price']-lot[1]-lot[2]-(t['fee']/t['qty'] if t['qty'] else 0))
+                matched+=take; remaining-=take; lot[0]-=take
+                if lot[0]<1e-10:q.popleft()
+            if remaining>1e-9: unmatched_sells+=1
+    open_cost=sum(lot[0]*(lot[1]+lot[2]) for q in queues.values() for lot in q)
+    open_qty=sum(lot[0] for q in queues.values() for lot in q)
+    unrealized=(open_qty*bid-open_cost) if bid is not None else None
+    return {'realized_pnl':round(realized,6),'unrealized_pnl':round(unrealized,6) if unrealized is not None else None,
+            'open_sol_cost':round(open_cost,6),'open_sol_qty':round(open_qty,9),
+            'avg_open_cost':round(open_cost/open_qty,6) if open_qty else None,
+            'matched_sell_sol':round(matched,9),'unmatched_sells':unmatched_sells,
+            'method':'FIFO per grid level; both trading fees included'}
+
+def range_analysis(c, price):
+    orders=[dict(x) for x in c.execute("SELECT side,price FROM orders WHERE status='OPEN'")]
+    buys=[o['price'] for o in orders if o['side']=='BUY']
+    sells=[o['price'] for o in orders if o['side']=='SELL']
+    if price is None or not orders: return {'state':'NO_GRID','out_of_range':False}
+    lowest=min(o['price'] for o in orders); highest=max(o['price'] for o in orders)
+    if price<lowest: state_name='BELOW'
+    elif price>highest: state_name='ABOVE'
+    else: state_name='INSIDE'
+    nearest_sell=min(sells) if sells else None
+    nearest_buy=max(buys) if buys else None
+    return {'state':state_name,'out_of_range':state_name!='INSIDE','low':lowest,'high':highest,
+            'buy_count':len(buys),'sell_count':len(sells),
+            'nearest_sell':nearest_sell,'nearest_buy':nearest_buy,
+            'distance_to_nearest_sell_pct':round((nearest_sell/price-1)*100,3) if nearest_sell and price else None,
+            'suggested_center':round(price,4),
+            'advice':'Rebase is advisory only; existing positions are never automatically sold or discarded.'}
+
+@app.get('/api/strategy')
+def strategy():
+    with connection() as c:
+        w=c.execute('SELECT * FROM wallet WHERE id=1').fetchone()
+        trades=c.execute('SELECT COUNT(*), MAX(ts) FROM trades').fetchone()
+        bid=state['bid']
+        p=position_analysis(c,bid)
+        r=range_analysis(c,state['price'])
+        samples=c.execute('SELECT COUNT(*), MIN(ts), MAX(ts) FROM market_samples').fetchone()
+    equity=w['usdt']+w['sol']*bid if bid is not None else None
+    return {'mode':'PAPER','network':NETWORK,'position':p,'range':r,
+            'capital':{'usdt':w['usdt'],'sol':w['sol'],'equity':equity,
+                       'sol_pct':round(w['sol']*bid/equity*100,2) if equity and bid else None},
+            'last_trade':trades[1],'trades_count':trades[0],
+            'history':{'samples':samples[0],'first':samples[1],'last':samples[2]},
+            'auto_recenter':os.getenv('AYLA_AUTO_RECENTER','1')=='1',
+            'safety':'Mainnet public prices only; auto-recenter only if SOL=0 after 6h outside; no exchange order placement.'}
+
+@app.get('/api/strategy/compare')
+async def strategy_compare(days:int=7,interval:str='60'):
+    if days not in (1,3,7,14,30) or interval not in ('15','60','240'):
+        raise HTTPException(422,'days 1,3,7,14,30; interval 15,60,240')
+    # Limit to Bybit 1000 recent candles, and disclose actual coverage.
+    needed=min(1000,max(20,days*1440//int(interval)))
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp=await client.get(BASE_URLS[NETWORK]+'/v5/market/kline',params={'category':'spot','symbol':SYMBOL,'interval':interval,'limit':needed})
+            resp.raise_for_status(); payload=resp.json()
+            if payload.get('retCode')!=0: raise ValueError(payload.get('retMsg'))
+            bars=sorted(payload['result']['list'],key=lambda x:int(x[0]))
+    except Exception as exc: raise HTTPException(503,str(exc))
+    if len(bars)<20: raise HTTPException(503,'Insufficient candles')
+    with connection() as c: cfg=dict(c.execute('SELECT * FROM config WHERE id=1').fetchone())
+    def simulate_variant(dynamic):
+        cash=100.;sol=0.;start=float(bars[0][4]);center=start;peak=100.;dd=0.;fills=0;fees=0.;rebalances=0
+        gap=cfg['gap']; steps=cfg['steps']; reserve=cfg['reserve'];size=cfg['order_usdt']
+        orders=[{'side':'BUY','price':center*(1-gap*i),'qty':size/(center*(1-gap*i)*(1+FEE))} for i in range(1,steps+1)]
+        below_count=0
+        for bar in bars[1:]:
+            high,low,close=float(bar[2]),float(bar[3]),float(bar[4])
+            # One fill per bar. Same fill assumptions for both strategies.
+            for i,o in enumerate(orders):
+                q=o['qty'];px=o['price']
+                if o['side']=='BUY' and low<=px and cash>=q*px*(1+FEE)+reserve:
+                    fee=q*px*FEE;cash-=q*px+fee;sol+=q;fees+=fee;fills+=1
+                    orders[i]={'side':'SELL','price':px*(1+gap),'qty':q};break
+                if o['side']=='SELL' and high>=px and sol+1e-9>=q:
+                    fee=q*px*FEE;cash+=q*px-fee;sol-=q;fees+=fee;fills+=1
+                    orders[i]={'side':'BUY','price':px/(1+gap),'qty':q};break
+            # Conservative dynamic rebase: only when FLAT (no SOL inventory).
+            # This avoids resetting underwater SELL positions.
+            if dynamic:
+                below_count=below_count+1 if close<min(o['price'] for o in orders) else 0
+                if below_count>=6 and sol<1e-8:
+                    center=close
+                    orders=[{'side':'BUY','price':center*(1-gap*i),'qty':size/(center*(1-gap*i)*(1+FEE))} for i in range(1,steps+1)]
+                    rebalances+=1;below_count=0
+            equity=cash+sol*close;peak=max(peak,equity);dd=max(dd,(peak-equity)/peak*100)
+            if dd>=8:break
+        return {'final':round(equity,4),'pnl_pct':round(equity-100,4),'fills':fills,'fees':round(fees,5),
+                'max_drawdown_pct':round(dd,3),'rebases':rebalances}
+    start=float(bars[0][4]);end=float(bars[-1][4]);coverage=(int(bars[-1][0])-int(bars[0][0]))/86400000
+    return {'mode':'BACKTEST','network':NETWORK,'candles':len(bars),'coverage_days':round(coverage,2),
+            'requested_days':days,'static':simulate_variant(False),'adaptive':simulate_variant(True),
+            'buy_hold_pct':round((end/start-1)*100,4),
+            'limitations':'OHLC approximation: one fill/bar, no spread/slippage, no intrabar sequence. Adaptive rebase only when SOL=0; may not trigger. Not a forecast.'}
+
+async def strategy_alerts():
+    # Persistent de-duplication: at most one message per condition per Kyiv day.
+    from zoneinfo import ZoneInfo
+    while True:
+        try:
+            if setting('tg_enabled')=='1' and state['price'] and state['running']:
+                with connection() as c:
+                    r=range_analysis(c,state['price'])
+                    last=c.execute('SELECT MAX(ts) FROM trades').fetchone()[0]
+                    center=c.execute('SELECT created FROM settings WHERE id=1').fetchone()
+                    since=last or (center['created'] if center else None)
+                    elapsed=(datetime.now(timezone.utc)-datetime.fromisoformat(since)).total_seconds()/3600 if since else 0
+                    today=datetime.now(ZoneInfo('Europe/Kyiv')).date().isoformat()
+                    alerts=[]
+                    if r.get('out_of_range'):
+                        alerts.append(('outside',f'🐶 Grid поза діапазоном: {r["state"]}; SOL {state["price"]:.4f}; сітка {r["low"]:.4f}–{r["high"]:.4f}. Автопереносу немає.'))
+                    if r.get('buy_count')==0:
+                        alerts.append(('no_buys','🐶 Усі активні ордери SELL; нових BUY поки немає.'))
+                    if elapsed>=float(setting('alert_no_trade_hours','24')):
+                        alerts.append(('idle',f'🐶 Немає виконань {elapsed:.0f} годин.'))
+                    pending=[]
+                    for key,message in alerts:
+                        fullkey=f'alert:{key}:{today}'
+                        if not c.execute('SELECT 1 FROM notifications WHERE key=?',(fullkey,)).fetchone():pending.append((fullkey,message))
+                for key,message in pending:
+                    await telegram_send(message)
+                    with connection() as c:c.execute('INSERT OR IGNORE INTO notifications VALUES (?,?)',(key,now()))
+        except Exception as exc: log.warning('Strategy alerts failed: %s',exc)
+        await asyncio.sleep(900)
 
 @app.get('/api/markets')
 async def markets():

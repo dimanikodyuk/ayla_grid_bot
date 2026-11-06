@@ -1,32 +1,38 @@
-# Ayla Grid Bot v0.8 — PAPER ONLY
+# Ayla Grid Bot v0.9 — Mainnet prices, PAPER only
 
-## What's new
-- Live Bybit public Spot WebSocket in browser for the selected **chart** market, with reconnect and REST fallback. WebSocket only updates the chart; backend paper fills still use REST ticker every ~5 seconds.
-- Mainnet/Testnet chart selector is **view-only**; paper execution always uses `BYBIT_ENV` from `.env`. Overlay of paper orders/trades only on the trading market.
-- Live candle updates, volume histogram, OHLC on hover, Kyiv timestamps, zoom and pan. 500 historical candles.
-- Market comparison card (public tickers) with 24h change.
-- Nearest BUY distance, 20-candle high-low range, last-candle price change.
-- Transient REST outages no longer permanently pause the bot; it skips fills until valid fresh quotes return. **8% drawdown stop remains permanent until manually restarted**.
-- Compatible with existing `ayla_v04.db`; no schema changes.
+## Changes
+- `BYBIT_ENV=mainnet`: uses **public** Bybit mainnet ticker/kline/WebSocket. No private Bybit order API is used. `mode=PAPER` always.
+- Database separation: testnet retains `ayla_v04.db`; mainnet creates `ayla_mainnet_paper.db` with fresh 100 virtual USDT. Never mix historical testnet SOL with mainnet prices.
+- Safe automatic re-centering: enabled by default (`AYLA_AUTO_RECENTER=1`), only when SOL balance is zero, every open order is BUY, and price has remained outside all BUY levels for 6 hours. Open BUY orders are replaced; trade history and wallet preserved. **No forced sales** and no re-centering while holding SOL.
+- `/api/strategy`: realized FIFO-per-level PnL, unrealized PnL, cost basis, portfolio exposure, range status and persistent 15-minute samples.
+- `/api/strategy/compare`: Static vs conservative adaptive backtest on the same public OHLC candles (1/3/7/14/30 days, capped to 1000 candles), plus buy-and-hold. No spread/slippage; not a live-execution guarantee.
+- Telegram alerts: once per condition per Kyiv day for out-of-range, all-SELL, and 24h inactivity, if Telegram is enabled. Alerts require working Telegram credentials.
+- Updated `index.html` with analytics, range panel, strategy comparison.
 
-## Installation on Raspberry Pi
-1. Stop: `sudo systemctl stop ayla-grid`.
-2. Backup: `cp main.py main_before_v08.py; cp index.html index_before_v08.html; cp ayla_v04.db ayla_v04_before_v08.db`.
-3. Copy `main.py`, `index.html` from ZIP to `~/ayla_grid_bot/`. **Do not overwrite `.env` or `ayla_v04.db`.**
-4. `cd ~/ayla_grid_bot && .venv/bin/python -m py_compile main.py`
-5. `sudo systemctl start ayla-grid && sudo systemctl status ayla-grid --no-pager`
-6. `curl -fsS http://127.0.0.1:8090/api/health` and `curl -fsS http://127.0.0.1:8090/api/markets`
-7. Browser Ctrl+F5. WebSocket requires the viewing browser to reach Bybit public WS. If unavailable, REST updates every 30 seconds.
+## Install on Raspberry Pi
 
-## Week-long run
-- For a meaningful paper test, choose `BYBIT_ENV=mainnet` and leave it unchanged for the entire period. Changing environment mid-run mixes histories.
-- The UI **does not need to remain open** for paper fills; `systemd` keeps the backend alive. Live WS is only for browser chart rendering.
-- Enable Telegram daily/trade notifications if desired; verify with Test button.
-- Verify `systemctl is-enabled ayla-grid` returns `enabled`; check `journalctl -u ayla-grid -n 30 --no-pager` if issues.
-- Preserve the database; do not press Reset during the test.
+1. `cd ~/ayla_grid_bot && sudo systemctl stop ayla-grid`
+2. Backup files AND consistent SQLite snapshot:
+   ```bash
+   cp main.py main_v082_backup.py
+   cp index.html index_v081_backup.html
+   .venv/bin/python - <<'PY'
+   import sqlite3
+   src=sqlite3.connect('ayla_v04.db')
+   dst=sqlite3.connect('ayla_v04_before_v09.db')
+   src.backup(dst)
+   dst.close();src.close()
+   PY
+   ```
+3. Copy new `main.py` and `index.html` into `/home/pi/ayla_grid_bot` (do not overwrite `.env` or databases).
+4. Edit `.env`: **set** `BYBIT_ENV=mainnet` (replace existing line, do not append a duplicate). Optional `AYLA_AUTO_RECENTER=1` or `0`. If systemd provides `BYBIT_ENV` via `Environment=`, it overrides `.env`; inspect `systemctl cat ayla-grid`.
+5. `.venv/bin/python -m py_compile main.py && sudo systemctl start ayla-grid`
+6. Check `curl -s http://127.0.0.1:8090/api/status | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["network"],d["mode"],d["running"],d["usdt"],d["sol"],d["error"])'`
+7. Expect `mainnet PAPER False 100.0 0.0 None` (the quote might take several seconds). Press Start Paper in dashboard only after verifying network and paper mode.
 
-## Security
-- No real trading; no private Bybit API calls. API keys not needed.
-- Web UI is unauthenticated, including Start/Pause/Reset. Never expose port 8090 publicly. Use `HOST=127.0.0.1` and SSH forwarding, or a trusted LAN only.
-- WebSocket chart data is public. TradingView Lightweight Charts loaded via CDN; fallback chart remains available.
-- Paper fills are optimistic, spread included but slippage/latency not modeled. Backtest OHLC is approximate.
+## Important
+- This release was syntax-checked and the BUY→SELL cycle was tested locally on an isolated SQLite DB; it has **not** been tested against your live Raspberry Pi or real Bybit mainnet feed.
+- `Reset Paper` deletes the current network's paper history. Avoid it.
+- Switching back to testnet by changing `.env` and restarting reopens the original testnet DB and its old paper state. Pause it before switching if needed.
+- The service binds 0.0.0.0 by default; do not expose port 8090 to the public internet without authentication.
+- Comparison is intentionally conservative and adaptive may have no advantage or may not re-center at all while SOL is held.
